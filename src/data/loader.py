@@ -2,7 +2,7 @@
 Raw data loader for NASA CMAPSS (C-MAPSS) dataset.
 
 Handles loading of train, test, and RUL files for all four subsets
-(FD001–FD004). This module is responsible ONLY for raw ingestion —
+(FD001-FD004). This module is responsible ONLY for raw ingestion -
 no preprocessing, normalization, or feature engineering occurs here.
 
 Dataset structure:
@@ -10,7 +10,7 @@ Dataset structure:
     - 26 columns: unit, cycle, 3 operational settings, 21 sensor readings
     - Train file: full run-to-failure sequences
     - Test file:  truncated sequences (RUL prediction target)
-    - RUL file:   true Remaining Useful Life for each test unit
+    - RUL file:   true Remaining Useful Life for each unit in test set
 
 Reference:
     Saxena, A. et al. (2008). Damage propagation modeling for aircraft
@@ -20,11 +20,20 @@ Reference:
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 
 from src.config import CMAPSSSubset, get_settings
+
+__all__ = [
+    "CMAPSSData",
+    "CMAPSSLoader",
+    "CMAPSS_COLUMNS",
+    "SENSOR_COLUMNS",
+    "OP_SETTING_COLUMNS",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +52,12 @@ SENSOR_COLUMNS: list[str] = [f"sensor_{i}" for i in range(1, 22)]
 #: Operational setting columns
 OP_SETTING_COLUMNS: list[str] = [f"op_setting_{i}" for i in range(1, 4)]
 
+#: Valid split literals for internal use
+_SplitLiteral = Literal["train", "test", "RUL"]
+
+#: Threshold for high-NaN ratio warning in sensor columns
+_HIGH_NAN_THRESHOLD: float = 0.05
+
 
 # ── Data Containers ────────────────────────────────────────────────────────
 
@@ -52,11 +67,18 @@ class CMAPSSData:
     """
     Immutable container for a loaded CMAPSS subset.
 
+    Note: frozen=True prevents attribute reassignment, but the
+    pd.DataFrame objects held by train and test are themselves mutable.
+    Downstream consumers must call .copy() before in-place mutation.
+
     Attributes:
-        subset:     Dataset subset identifier (e.g. FD001)
-        train:      Training DataFrame with RUL column appended
-        test:       Test DataFrame (truncated sequences, no RUL)
-        rul:        True RUL values for each unit in test set
+        subset: Dataset subset identifier (e.g. FD001)
+        train:  Training DataFrame with RUL column appended.
+                shape: (N, 27) - 26 CMAPSS columns + rul
+        test:   Test DataFrame (truncated sequences, no RUL).
+                shape: (M, 26) - 26 CMAPSS columns only
+        rul:    True RUL values for each unit in test set.
+                1-indexed to match CMAPSS unit numbering convention.
     """
 
     subset: CMAPSSSubset
@@ -79,9 +101,9 @@ class CMAPSSLoader:
         - Validate loaded data for basic sanity checks
 
     Does NOT:
-        - Normalize or scale any values  → preprocessor.py
-        - Engineer features              → feature_engineer.py
-        - Split train/validation         → trainer.py
+        - Normalize or scale any values  -> preprocessor.py
+        - Engineer features              -> feature_engineer.py
+        - Split train/validation         -> trainer.py
 
     Usage:
         loader = CMAPSSLoader()
@@ -107,6 +129,9 @@ class CMAPSSLoader:
         """
         Load all three CMAPSS files for the configured subset.
 
+        Synchronous. In async contexts, wrap with:
+            await asyncio.to_thread(loader.load)
+
         Returns:
             CMAPSSData: Immutable container with train, test, and RUL data.
 
@@ -114,7 +139,11 @@ class CMAPSSLoader:
             FileNotFoundError: If any required file is missing.
             ValueError: If loaded data fails sanity checks.
         """
-        logger.info("Loading CMAPSS subset %s from %s", self._subset.value, self._raw_path)
+        logger.info(
+            "Loading CMAPSS subset %s from %s",
+            self._subset.value,
+            self._raw_path,
+        )
 
         train_df = self._load_sequences(split="train")
         test_df = self._load_sequences(split="test")
@@ -125,7 +154,7 @@ class CMAPSSLoader:
         self._validate(train_df, test_df, rul_series)
 
         logger.info(
-            "Loaded %s — train: %d rows (%d units) | test: %d rows (%d units) | RUL: %d values",
+            "Loaded %s - train: %d rows (%d units) | test: %d rows (%d units) | RUL: %d values",
             self._subset.value,
             len(train_df),
             train_df["unit"].nunique(),
@@ -143,7 +172,7 @@ class CMAPSSLoader:
 
     # ── Private Helpers ────────────────────────────────────────────────────
 
-    def _resolve_path(self, split: str) -> Path:
+    def _resolve_path(self, split: _SplitLiteral) -> Path:
         """
         Resolve the file path for a given split.
 
@@ -168,7 +197,7 @@ class CMAPSSLoader:
 
         return path
 
-    def _load_sequences(self, split: str) -> pd.DataFrame:
+    def _load_sequences(self, split: _SplitLiteral) -> pd.DataFrame:
         """
         Load train or test sequence file.
 
@@ -176,7 +205,10 @@ class CMAPSSLoader:
             split: 'train' or 'test'
 
         Returns:
-            DataFrame with 26 named columns, dtypes inferred.
+            DataFrame with exactly 26 named columns, dtypes enforced.
+
+        Raises:
+            ValueError: If the file is empty or has unexpected column count.
         """
         path = self._resolve_path(split)
 
@@ -193,8 +225,24 @@ class CMAPSSLoader:
             },
         )
 
-        # CMAPSS files sometimes have a trailing empty column — drop it
+        # Guard: empty file produces a zero-row DataFrame with misleading state
+        if df.empty:
+            raise ValueError(
+                f"CMAPSS file is empty: {path}\n"
+                "Download a fresh copy from Kaggle."
+            )
+
+        # CMAPSS files sometimes have a trailing empty column - drop it
         df = df.dropna(axis=1, how="all")
+
+        # Assert exactly 26 columns remain after dropping phantom columns.
+        # A real sensor column that is entirely NaN would be silently dropped
+        # here; catching it now prevents a cryptic KeyError in preprocessing.
+        if len(df.columns) != len(CMAPSS_COLUMNS):
+            raise ValueError(
+                f"Expected {len(CMAPSS_COLUMNS)} columns after parsing, "
+                f"got {len(df.columns)}. File may be malformed: {path}"
+            )
 
         logger.debug("Loaded %s split: %d rows, %d columns", split, len(df), len(df.columns))
         return df
@@ -211,9 +259,14 @@ class CMAPSSLoader:
         """
         path = self._resolve_path("RUL")
 
-        rul = pd.read_csv(path, header=None, names=["rul"], dtype={"rul": np.int32})
+        rul = pd.read_csv(
+            path,
+            header=None,
+            names=["rul"],
+            dtype={"rul": np.int32},
+        )
 
-        # Index from 1 to match unit numbering convention
+        # Index from 1 to match CMAPSS unit numbering convention
         rul.index = pd.RangeIndex(start=1, stop=len(rul) + 1, step=1)
 
         return rul["rul"]
@@ -230,7 +283,13 @@ class CMAPSSLoader:
 
         Returns:
             DataFrame with 'rul' column appended.
+
+        Raises:
+            ValueError: If the input DataFrame is empty.
         """
+        if df.empty:
+            raise ValueError("Training DataFrame is empty — cannot compute RUL.")
+
         max_cycles = df.groupby("unit")["cycle"].transform("max")
         df = df.copy()
         df["rul"] = (max_cycles - df["cycle"]).astype(np.int32)
@@ -243,7 +302,7 @@ class CMAPSSLoader:
         rul: pd.Series,
     ) -> None:
         """
-        Run basic sanity checks on loaded data.
+        Run sanity checks on loaded data.
 
         Args:
             train: Training DataFrame with RUL appended.
@@ -251,7 +310,7 @@ class CMAPSSLoader:
             rul:   RUL Series for test units.
 
         Raises:
-            ValueError: If any check fails.
+            ValueError: If any critical check fails.
         """
         # RUL count must match number of test units
         n_test_units = test["unit"].nunique()
@@ -261,17 +320,43 @@ class CMAPSSLoader:
                 f"{n_test_units} units. Data may be corrupted."
             )
 
+        # Test unit IDs must be sequential from 1 to n
+        # (guards against gaps from file corruption e.g. {1, 2, 4})
+        expected_units = set(range(1, n_test_units + 1))
+        actual_units = set(test["unit"].unique())
+        if expected_units != actual_units:
+            raise ValueError(
+                f"Test unit IDs are not sequential from 1: {sorted(actual_units)}"
+            )
+
         # Training RUL must be non-negative
         if (train["rul"] < 0).any():
             raise ValueError("Negative RUL values detected in training data.")
+
+        # Ground truth RUL must be non-negative
+        if (rul < 0).any():
+            raise ValueError("Negative values detected in RUL ground truth file.")
+
+        # Cycle numbers must be positive
+        if (train["cycle"] <= 0).any() or (test["cycle"] <= 0).any():
+            raise ValueError("Non-positive cycle numbers detected.")
 
         # No fully-null columns
         null_cols = train.columns[train.isnull().all()].tolist()
         if null_cols:
             raise ValueError(f"Fully null columns found in training data: {null_cols}")
 
-        # Cycle numbers must be positive
-        if (train["cycle"] <= 0).any() or (test["cycle"] <= 0).any():
-            raise ValueError("Non-positive cycle numbers detected.")
+        # Warn on high-NaN sensor columns (non-fatal: log only)
+        high_nan = [
+            col for col in SENSOR_COLUMNS
+            if train[col].isnull().mean() > _HIGH_NAN_THRESHOLD
+        ]
+        if high_nan:
+            logger.warning(
+                "High NaN ratio (>%.0f%%) detected in columns: %s — "
+                "review before feature engineering.",
+                _HIGH_NAN_THRESHOLD * 100,
+                high_nan,
+            )
 
         logger.debug("Data validation passed.")
