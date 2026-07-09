@@ -1,0 +1,70 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [develop, "feature/**", "fix/**", "chore/**"]
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  quality:
+    name: Code Quality & Security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Lint — ruff check
+        run: uv run ruff check src/ tests/ dashboard/
+
+      - name: Format — ruff format check
+        run: uv run ruff format src/ tests/ dashboard/ --check
+
+      - name: Type check — mypy
+        run: uv run mypy src/
+
+      - name: Security scan — bandit
+        run: uv run bandit -r src/ -ll -c pyproject.toml
+
+  test:
+    name: Tests & Coverage
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run tests with coverage
+        run: uv run pytest tests/ -v --cov=src --cov-report=term-missing
+
+      - name: Coverage gate (minimum 70%)
+        run: uv run pytest tests/ --cov=src --cov-fail-under=70 --no-header -q
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: htmlcov/
