@@ -197,7 +197,7 @@ class CMAPSSLoader:
 
         return path
 
-    def _load_sequences(self, split: _SplitLiteral) -> pd.DataFrame:
+    def _load_sequences(self, split: Literal["train", "test"]) -> pd.DataFrame:
         """
         Load train or test sequence file.
 
@@ -243,6 +243,9 @@ class CMAPSSLoader:
                 f"Expected {len(CMAPSS_COLUMNS)} columns after parsing, "
                 f"got {len(df.columns)}. File may be malformed: {path}"
             )
+
+        # This is also the ONLY place all-null columns are caught — see
+        # _validate(), which relies on this guard already having fired.
 
         logger.debug("Loaded %s split: %d rows, %d columns", split, len(df), len(df.columns))
         return df
@@ -341,11 +344,13 @@ class CMAPSSLoader:
         if (train["cycle"] <= 0).any() or (test["cycle"] <= 0).any():
             raise ValueError("Non-positive cycle numbers detected.")
 
-        # No fully-null columns
-        null_cols = train.columns[train.isnull().all()].tolist()
-        if null_cols:
-            raise ValueError(f"Fully null columns found in training data: {null_cols}")
+        # All-null columns are caught upstream in _load_sequences — see
+        # the dropna + column count assertion there. No check is needed
+        # (and none is reachable) here.
 
+        # Scoped to SENSOR_COLUMNS only: OP_SETTING_COLUMNS represent
+        # discrete flight condition clusters in CMAPSS, where partial NaN
+        # has a different interpretation and isn't a data-quality signal.
         # Warn on high-NaN sensor columns (non-fatal: log only)
         high_nan = [
             col for col in SENSOR_COLUMNS

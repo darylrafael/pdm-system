@@ -7,11 +7,13 @@ Strategy:
     - Fixtures generate synthetic CMAPSS-format data deterministically
 """
 
+import logging
+from pathlib import Path
+from unittest.mock import patch
+
 import numpy as np
 import pandas as pd
 import pytest
-from pathlib import Path
-from unittest.mock import patch
 
 from src.config import CMAPSSSubset
 from src.data.loader import (
@@ -219,11 +221,11 @@ class TestErrorHandling:
         with pytest.raises(ValueError, match="RUL file has"):
             loader.load()
 
-    def test_negative_cycles_raises(self, cmapss_dir: Path, tmp_path: Path) -> None:
+    def test_negative_cycles_raises(self, cmapss_dir: Path) -> None:
         # Build a corrupt file explicitly: unit=1, cycle=-1 guaranteed
         bad_df = _make_sequence_df(n_units=2, cycles_per_unit=5)
         bad_df.loc[0, "cycle"] = -1  # explicitly corrupt the cycle column
-        bad_df.to_csv(cmapss_dir / "train_FD001.txt", sep=" ", header=False, index=False)
+        bad_df.to_csv(cmapss_dir / "train_FD001.txt", sep=" ", header=False, index=False, na_rep='NaN')
 
         with patch("src.data.loader.get_settings") as mock:
             mock.return_value.cmapss_subset = CMAPSSSubset.FD001
@@ -244,7 +246,7 @@ class TestErrorHandling:
     def test_wrong_column_count_raises(self, cmapss_dir: Path) -> None:
         # Write a file with only 10 columns (simulates all-null sensor dropout)
         bad_df = _make_sequence_df(n_units=2, cycles_per_unit=5).iloc[:, :10]
-        bad_df.to_csv(cmapss_dir / "train_FD001.txt", sep=" ", header=False, index=False)
+        bad_df.to_csv(cmapss_dir / "train_FD001.txt", sep=" ", header=False, index=False, na_rep='NaN')
 
         with patch("src.data.loader.get_settings") as mock:
             mock.return_value.cmapss_subset = CMAPSSSubset.FD001
@@ -294,3 +296,48 @@ class TestMultiSubset:
         assert result.subset == CMAPSSSubset.FD002
         assert len(result.train) == 30   # 3 units x 10 cycles
         assert len(result.rul) == 2
+
+
+# ── Format Edge Cases ──────────────────────────────────────────────────────
+
+class TestFormatEdgeCases:
+    def test_trailing_null_column_is_dropped(self, cmapss_dir: Path) -> None:
+        """27-column file (CMAPSS trailing-space quirk) loads correctly as 26 columns."""
+        df_with_phantom = _make_sequence_df(n_units=2, cycles_per_unit=5)
+        df_with_phantom["_phantom"] = np.nan  # simulate all-null trailing column
+        df_with_phantom.to_csv(
+            cmapss_dir / "train_FD001.txt", sep=" ", header=False, index=False,
+            na_rep='NaN'
+        )
+        _write_sequence_file(cmapss_dir / "test_FD001.txt", n_units=2, cycles_per_unit=5)
+        _write_rul_file(cmapss_dir / "RUL_FD001.txt", n_units=2)
+
+        with patch("src.data.loader.get_settings") as mock:
+            mock.return_value.cmapss_subset = CMAPSSSubset.FD001
+            mock.return_value.data_raw_path = str(cmapss_dir)
+            loader = CMAPSSLoader(subset=CMAPSSSubset.FD001)
+
+        result = loader.load()
+        assert set(result.train.columns) == set(CMAPSS_COLUMNS) | {"rul"}
+
+    def test_high_nan_sensor_triggers_warning(
+        self, cmapss_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Sensor column with >5% NaN ratio triggers a warning log."""
+
+        df = _make_sequence_df(n_units=2, cycles_per_unit=10)
+        df.loc[df.index[1:], "sensor_1"] = np.nan  # >5% NaN on sensor_1
+        df.to_csv(cmapss_dir / "train_FD001.txt", sep=" ", header=False, index=False, na_rep='NaN')
+        _write_sequence_file(cmapss_dir / "test_FD001.txt", n_units=2, cycles_per_unit=5)
+        _write_rul_file(cmapss_dir / "RUL_FD001.txt", n_units=2)
+
+        with patch("src.data.loader.get_settings") as mock:
+            mock.return_value.cmapss_subset = CMAPSSSubset.FD001
+            mock.return_value.data_raw_path = str(cmapss_dir)
+            loader = CMAPSSLoader(subset=CMAPSSSubset.FD001)
+
+        with caplog.at_level(logging.WARNING, logger="src.data.loader"):
+            loader.load()
+
+        assert "High NaN ratio" in caplog.text
+        assert "sensor_1" in caplog.text
