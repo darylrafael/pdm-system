@@ -91,24 +91,27 @@ class ProcessedData:
     Note: frozen=True prevents attribute reassignment, but DataFrames
     are mutable. Downstream consumers must .copy() before in-place ops.
 
-    Invariant: norm_params.keys() always equals set(feature_cols) exactly.
-    Any op_setting column found to have zero range (min == max) in the
-    training data is excluded from both feature_cols and norm_params,
-    since it carries no normalizable signal. Downstream code may safely
-    assume every column in feature_cols has a corresponding entry in
-    norm_params.
+    Note: feature_cols is a tuple (not a list) so that the "immutable
+    container" guarantee extends past the top-level frozen dataclass
+    fields into this ordering-sensitive sequence, and so that equality
+    comparisons against EngineeredData.base_feature_cols (also a tuple,
+    see feature_engineer.py) succeed downstream rather than always
+    evaluating False due to a tuple/list type mismatch.
+
+    Invariant: norm_params.keys() is guaranteed to exactly match the
+    elements of feature_cols. feature_cols is pruned during
+    fit_transform() to remove any column that _fit_normalization()
+    excluded (e.g. a zero-range op_setting column), so consumers can
+    trust that every entry in feature_cols has a corresponding
+    normalization parameter, and vice versa.
 
     Attributes:
         train:           Normalized training DataFrame with clipped RUL.
         test:            Normalized test DataFrame (no RUL column).
         rul:             Ground truth RUL Series for test units (unchanged).
-        feature_cols:    Ordered list of columns used as model input
-                          features. Always matches norm_params.keys()
-                          exactly (see norm_params).
-        norm_params:     {col: {"min": float, "max": float}} fit on train
-                          only. Keys always match feature_cols exactly;
-                          a zero-range op_setting column is excluded from
-                          both rather than included at raw scale.
+        feature_cols:    Ordered tuple of columns used as model input
+                         features.
+        norm_params:     {col: {"min": float, "max": float}} fit on train only.
         max_rul:         RUL cap value applied during preprocessing.
         dropped_sensors: Sensor columns removed due to near-zero variance.
     """
@@ -116,7 +119,7 @@ class ProcessedData:
     train: pd.DataFrame
     test: pd.DataFrame
     rul: pd.Series
-    feature_cols: list[str]
+    feature_cols: tuple[str, ...]
     norm_params: dict[str, dict[str, float]]
     max_rul: int
     dropped_sensors: list[str]
@@ -170,10 +173,13 @@ class CMAPSSPreprocessor:
         Steps:
             1. Drop constant/near-zero-variance sensor columns
             2. Clip training RUL to max_rul
-            3. Define feature columns (post drop)
-            4. Fit Min-Max params on train only  (no leakage) — any
-               zero-range op_setting column is excluded from feature_cols
-               here as well, keeping feature_cols and norm_params in sync
+            3. Fit Min-Max params on train only  (no leakage)
+            4. Reconcile feature_cols with norm_params — a zero-range
+               op_setting column is excluded from norm_params during
+               fitting but is still present in feature_cols at that
+               point, so feature_cols is pruned to match norm_params
+               exactly, preserving the invariant documented on
+               ProcessedData.
             5. Apply normalization to both train and test
 
         Synchronous. In async contexts, wrap with:
@@ -214,9 +220,10 @@ class CMAPSSPreprocessor:
         # Step 4 — Fit normalization on train only
         self._fit_normalization(train)
 
-        # Zero-range op_setting columns are excluded from norm_params by
-        # _fit_normalization; keep feature_cols consistent with
-        # norm_params so the two always share the same key set.
+        # Reconcile feature_cols with norm_params — a zero-range op_setting
+        # is excluded from norm_params by _fit_normalization but is still
+        # in self._feature_cols at this point. Prune feature_cols to match
+        # norm_params exactly so the two always share the same key set.
         self._feature_cols = [
             col for col in self._feature_cols if col in self._norm_params
         ]
@@ -238,7 +245,7 @@ class CMAPSSPreprocessor:
             train=train,
             test=test,
             rul=data.rul,
-            feature_cols=list(self._feature_cols),
+            feature_cols=tuple(self._feature_cols),
             norm_params={k: dict(v) for k, v in self._norm_params.items()},
             max_rul=self._max_rul,
             dropped_sensors=list(self._dropped_sensors),
@@ -348,23 +355,25 @@ class CMAPSSPreprocessor:
         Only normalizes sensor + op_setting columns.
         unit, cycle, and rul are left in their original scale.
 
-        Sensor columns are expected to have already been screened for
-        zero-range (constant) values by _drop_constant_sensors(); a
-        zero-range sensor column here indicates that screening was
-        bypassed and is treated as an error. Op_setting columns are NOT
-        screened by _drop_constant_sensors() (which is sensor-only), so
-        a zero-range op_setting column is logged and skipped instead of
-        raising — it is excluded from norm_params entirely (see the
-        feature_cols/norm_params invariant note in fit_transform, which
-        subsequently removes any such column from self._feature_cols so
-        the two stay in sync).
+        Zero-range handling differs by column family:
+            - Sensor columns: a zero range here raises, because
+              _drop_constant_sensors() should already have removed every
+              constant sensor upstream. If one still has zero range at
+              this point, detection was bypassed or the data is
+              corrupted — that is treated as a hard error rather than
+              silently degrading the model.
+            - op_setting columns: a zero range here only warns and
+              excludes the column, because operating-condition settings
+              are expected to sometimes be constant across a given
+              subset (e.g. FD001 has a single operating condition) —
+              this is a normal condition, not a data integrity failure.
 
         Args:
             train: Training DataFrame (post constant-sensor removal).
 
         Raises:
             ValueError: If any sensor column has min == max (undropped
-                constant sensor).
+                constant).
         """
         cols_to_normalize = [
             col for col in self._feature_cols
@@ -400,9 +409,7 @@ class CMAPSSPreprocessor:
             if op_setting_zero_range:
                 logger.warning(
                     "Zero range (min == max) in op_setting columns: %s — "
-                    "_drop_constant_sensors() only screens sensor columns, "
-                    "not op_settings. Excluding these columns from "
-                    "norm_params and feature_cols entirely.",
+                    "excluding from feature_cols and norm_params entirely.",
                     op_setting_zero_range,
                 )
 
@@ -415,7 +422,9 @@ class CMAPSSPreprocessor:
         Apply fitted Min-Max normalization to a DataFrame.
 
         Columns not in norm_params (unit, cycle, rul) are preserved as-is.
-        Missing columns in df are silently skipped, with a warning logged.
+        Missing columns in df are skipped, but a warning is logged since
+        a missing expected feature column can silently corrupt downstream
+        model predictions at inference time.
 
         Args:
             df: DataFrame to normalize (modified copy is returned).
@@ -428,9 +437,10 @@ class CMAPSSPreprocessor:
         for col, params in self._norm_params.items():
             if col not in df.columns:
                 logger.warning(
-                    "Column '%s' expected by norm_params but missing from "
-                    "input — skipping normalization. Model predictions may "
-                    "be corrupted.",
+                    "Expected feature column '%s' not found in DataFrame — "
+                    "skipping normalization for this column. Model "
+                    "predictions may be corrupted if this column is "
+                    "required downstream.",
                     col,
                 )
                 continue
